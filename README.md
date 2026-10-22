@@ -78,8 +78,8 @@ flowchart TD
 Clone the repository and install the Python dependencies:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/YOUR_REPOSITORY.git
-cd YOUR_REPOSITORY
+git clone https://github.com/JuanCanteroJimenez/PokeLLMAgent.git
+cd PokeLLMAgent
 
 python -m venv .venv
 source .venv/bin/activate       # macOS / Linux
