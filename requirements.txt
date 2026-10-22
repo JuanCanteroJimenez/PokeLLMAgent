@@ -1,0 +1,14 @@
+beautifulsoup4==4.15.0
+deepagents==0.7.18
+ipykernel==7.3.0
+langfuse==4.15.4
+langgraph-checkpoint-postgres==3.1.2
+langmem==0.0.30
+matplotlib==3.11.2
+pip==23.2.1
+poke_env==0.16.1
+psycopg-binary==3.3.6
+python-dotenv==1.2.3
+pytest>=8
+langchain_openai
+openai
