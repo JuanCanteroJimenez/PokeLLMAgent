@@ -196,3 +196,386 @@ class V4Player(Player):
         self.analytics.close()
         self._trace_repo.close()
         self.langfuse.flush()
+
+
+
+
+class AgentBase(Player):
+    """
+    Baseline LLM Pokémon agent.
+
+    Uses only the current battle state and previous selected action.
+
+    Excludes:
+    - Completed-turn history tracking
+    - Historical matchup analytics
+    - PostgreSQL persistence
+    - V4 Speed estimation
+    - V4 managed prompts and strategic memory
+
+    Preserves:
+    - Structured LLM decisions
+    - Legal move/switch validation
+    - Terastallization
+    - Random fallback
+    - Langfuse tracing and LLM callbacks
+    """
+
+    def __init__(
+        self,
+        model="gpt-6-luna",
+        reasoning_effort="high",
+        service_tier="default",
+        temperature=None,
+        *args,
+        **kwargs,
+    ):
+        from typing import Literal
+        from pydantic import create_model
+
+        configure_file_logging()
+
+        # -------------------------------
+        # Langfuse
+        # -------------------------------
+        self.langfuse = get_client()
+        self.langfuse_handler = CallbackHandler()
+
+        # -------------------------------
+        # LLM
+        # -------------------------------
+        self.llm = ChatOpenAI(
+            model=model,
+            reasoning_effort=reasoning_effort,
+            service_tier=service_tier,
+            temperature=temperature,
+        )
+
+        # Baseline schema: no V4 strategy/rationale requirements.
+        self._decision_schema = create_model(
+            "BaselineMoveDecision",
+            action=(Literal["move", "switch"], ...),
+            target=(str, ...),
+            terastallize=(bool, False),
+        )
+
+        # Reuse the repository's move/switch resolver.
+        self.actions = ActionResolver(self, self.langfuse)
+
+        # Keep state isolated across simultaneous battles.
+        # This is NOT a completed-turn history tracker.
+        self._battle_states = {}
+
+        # Compatibility with the original AgentBase interface.
+        self.battle_state = None
+        self._current_battle_tag = None
+
+        self._setup_agent()
+
+        # Initialize poke-env only after dependencies exist.
+        super().__init__(*args, **kwargs)
+
+    def _setup_agent(self):
+        """Optional extension point for baseline subclasses."""
+        pass
+
+    def update_battle_state(self, battle: Battle) -> dict:
+        """
+        Build the original baseline battle state.
+
+        Reuse ContextBuilder's existing snapshot helpers without
+        calling ContextBuilder.build(), which would introduce
+        V4 history tracking, analytics and Speed estimation.
+        """
+        tag = battle.battle_tag
+        previous = self._battle_states.get(tag, {})
+
+        active = ContextBuilder._pokemon(battle.active_pokemon)
+        opponent = ContextBuilder._pokemon(
+            battle.opponent_active_pokemon
+        )
+
+        state = {
+            "active_pokemon": (
+                active.prompt_dict() if active else None
+            ),
+            "opponent_active_pokemon": (
+                opponent.prompt_dict() if opponent else None
+            ),
+            "available_moves": [
+                ContextBuilder._move(move).model_dump(mode="json")
+                for move in battle.available_moves
+            ],
+            "available_switches": [
+                ContextBuilder._switch(pokemon).model_dump(
+                    mode="json"
+                )
+                for pokemon in battle.available_switches
+            ],
+            "known_opponent_team": [
+                ContextBuilder._pokemon(pokemon).prompt_dict()
+                for pokemon in battle.opponent_team.values()
+            ],
+            "weather": [
+                str(weather) for weather in battle.weather
+            ],
+            "fields": [
+                str(field) for field in battle.fields
+            ],
+            "side_conditions": {
+                str(condition): value
+                for condition, value
+                in battle.side_conditions.items()
+            },
+            "opponent_side_conditions": {
+                str(condition): value
+                for condition, value
+                in battle.opponent_side_conditions.items()
+            },
+            "can_terastallize": bool(battle.can_tera),
+            "last_move": previous.get("last_move"),
+        }
+
+        self._battle_states[tag] = state
+        self._current_battle_tag = tag
+        self.battle_state = state
+
+        return state
+
+    async def decide_next_move(self, battle_state: dict) -> dict:
+        """
+        Original one-shot baseline decision policy.
+
+        No replay history, analytics, empirical evidence,
+        managed V4 prompts or strategy memory.
+        """
+        import json
+
+        system_prompt = """
+        You are a Pokémon battle agent.
+
+        Choose exactly one legal action for the current turn.
+
+        You must:
+        - Consider both active Pokémon.
+        - Consider HP, status, stat boosts and types.
+        - Consider weather, terrain and side conditions.
+        - Consider the currently known opponent team.
+        - Only use moves listed in available_moves.
+        - Only switch to Pokémon in available_switches.
+        - Never invent moves or Pokémon.
+        - Only Terastallize when it is permitted.
+
+        If action is "move", target must be the move ID.
+
+        If action is "switch", target must be the Pokémon
+        species from available_switches.
+
+        Return exactly one action.
+        """.strip()
+
+        battle_prompt = (
+            "CURRENT BATTLE STATE\n\n"
+            + json.dumps(
+                battle_state,
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n\nChoose the best next action."
+        )
+
+        decision_model = self.llm.with_structured_output(
+            self._decision_schema
+        )
+
+        decision = await decision_model.ainvoke(
+            [
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": battle_prompt,
+                },
+            ],
+            config={
+                "callbacks": [self.langfuse_handler]
+            },
+        )
+
+        return decision.model_dump(mode="json")
+
+    async def choose_move(self, battle: Battle):
+        """
+        Execute one baseline decision with Langfuse tracing.
+
+        Every decision includes:
+        - Current battle state
+        - LLM decision
+        - Legal action resolution
+        - Submitted order or fallback
+        """
+        agent_type = type(self).__name__
+        agent_name = self.username
+        tag = battle.battle_tag
+        turn = int(battle.turn or 0)
+
+        with self.langfuse.start_as_current_observation(
+            as_type="agent",
+            name=f"choose-move-{agent_type}-{agent_name}",
+            input={
+                "battle_tag": tag,
+                "turn": turn,
+                "agent": agent_name,
+            },
+        ) as agent_span:
+
+            with propagate_attributes(
+                session_id=tag,
+                tags=[
+                    "pokemon-showdown",
+                    "poke-env",
+                    f"agent-type:{agent_type}",
+                    f"agent:{agent_name}",
+                    "baseline",
+                ],
+                metadata={
+                    "battle_tag": tag,
+                    "turn": turn,
+                    "agent_type": agent_type,
+                    "agent_name": agent_name,
+                },
+            ):
+                try:
+                    # -------------------------------
+                    # 1. Current battle state
+                    # -------------------------------
+                    with self.langfuse.start_as_current_observation(
+                        as_type="span",
+                        name="update-battle-state",
+                    ) as span:
+
+                        state = self.update_battle_state(battle)
+
+                        span.update(
+                            output=json_safe(state)
+                        )
+
+                    # -------------------------------
+                    # 2. LLM decision
+                    # -------------------------------
+                    with self.langfuse.start_as_current_observation(
+                        as_type="span",
+                        name="decide-next-move",
+                        input=json_safe(state),
+                    ) as span:
+
+                        result = await self.decide_next_move(state)
+
+                        span.update(
+                            output=json_safe(result)
+                        )
+
+                    # -------------------------------
+                    # 3. Resolve legal action
+                    # -------------------------------
+                    data = (
+                        result.model_dump()
+                        if hasattr(result, "model_dump")
+                        else result
+                    )
+
+                    proposal = self._decision_schema.model_validate(
+                        data
+                    )
+
+                    # ActionResolver already provides:
+                    # - resolve-move / resolve-switch spans
+                    # - target normalization
+                    # - legality validation
+                    # - Terastallization checks
+                    # - random fallback
+                    order, submitted, fallback = (
+                        self.actions.resolve(battle, proposal)
+                    )
+
+                    # Remember only the submitted action.
+                    # No replay history is maintained.
+                    state["last_move"] = submitted
+
+                    # -------------------------------
+                    # 4. Langfuse final output
+                    # -------------------------------
+                    agent_span.update(
+                        output={
+                            "proposed_action": json_safe(data),
+                            "submitted_action": json_safe(submitted),
+                            "fallback_reason": fallback,
+                        }
+                    )
+
+                    agent_span.score(
+                        name="random_fallback_used",
+                        value=float(bool(fallback)),
+                        data_type="BOOLEAN",
+                    )
+
+                    return order
+
+                except Exception as exc:
+                    # -------------------------------
+                    # 5. Unexpected-error fallback
+                    # -------------------------------
+                    logger.exception(
+                        "Baseline decision failed: "
+                        "battle=%s turn=%s",
+                        tag,
+                        turn,
+                    )
+
+                    fallback = self.choose_random_move(battle)
+
+                    if tag in self._battle_states:
+                        self._battle_states[tag]["last_move"] = {
+                            "action": "fallback_random"
+                        }
+
+                    agent_span.update(
+                        output={
+                            "action": "fallback_random",
+                            "reason": "decision_exception",
+                            "error": (
+                                f"{type(exc).__name__}: {exc}"
+                            ),
+                        }
+                    )
+
+                    agent_span.score(
+                        name="random_fallback_used",
+                        value=1.0,
+                        data_type="BOOLEAN",
+                    )
+
+                    return fallback
+
+    def _battle_finished_callback(
+        self, battle: Battle
+    ) -> None:
+        """
+        Release baseline state after battle completion.
+
+        No history persistence or PostgreSQL finalization.
+        """
+        if not isinstance(battle, Battle):
+            return
+
+        self._battle_states.pop(battle.battle_tag, None)
+
+        if self._current_battle_tag == battle.battle_tag:
+            self._current_battle_tag = None
+            self.battle_state = None
+
+    def close_resources(self) -> None:
+        """Flush pending Langfuse observations at shutdown."""
+        self.langfuse.flush()
